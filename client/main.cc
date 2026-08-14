@@ -1,4 +1,7 @@
+#include <atomic>
 #include <chrono>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -16,22 +19,25 @@ public:
   ~ChatClient();
 
   void run();
+
+private:
   void setupUI();
+  void collectInputFields();
+  std::string readField(const std::string &label,
+                        const std::string &default_value, bool hidden);
   void handleInput();
   void updateUI();
-  void connectToServer();
+  void connectToServer(const std::vector<nexilis::RoomInfo> &rooms);
   void sendMessage(const std::string &message);
+  void pollRoomMessages();
   void displayMessages();
   void displayInputFields();
   void displayStatus();
 
-private:
-  void handleServerMessages();
   void updateMessages(const std::string &message);
 
-private:
   nexilis::ProtocolManager m_protocol_manager;
-  nexilis::TCPClient m_tcp_client;
+  std::unique_ptr<nexilis::TCPClient> m_tcp_client;
 
   // UI elements
   WINDOW *input_win;
@@ -43,18 +49,27 @@ private:
   std::string server_password;
   std::string client_username;
 
+  // Message currently being typed
+  std::string current_message;
+
+  // Connection state
+  bool connected;
+  bool authenticated;
+
   // Messages
   std::vector<std::string> messages;
+
+  // Joined room state
+  uint64_t m_room_id = 0;
+  size_t m_last_message_count = 0;
 };
 
-ChatClient::ChatClient()
-    : m_tcp_client(&m_protocol_manager, "127.0.0.1", "password") {
-
+ChatClient::ChatClient() : connected(false), authenticated(false) {
   // Initialize ncurses
   initscr();
   cbreak();
   noecho();
-  nodelay(stdscr, TRUE);
+  curs_set(1);
   keypad(stdscr, TRUE);
 
   // Create windows
@@ -72,6 +87,9 @@ void ChatClient::setupUI() {
   input_win = newwin(7, width, height - 7, 0);
   status_win = newwin(3, width, height - 10, 0);
 
+  keypad(input_win, TRUE);
+  nodelay(input_win, TRUE);
+
   box(message_win, 0, 0);
   box(input_win, 0, 0);
   box(status_win, 0, 0);
@@ -82,76 +100,119 @@ void ChatClient::setupUI() {
   wrefresh(status_win);
 }
 
+std::string ChatClient::readField(const std::string &label,
+                                  const std::string &default_value,
+                                  bool hidden) {
+  std::string value;
+
+  while (true) {
+    werase(input_win);
+    box(input_win, 0, 0);
+
+    std::string shown = value;
+    if (hidden && !shown.empty()) {
+      shown.assign(shown.size(), '*');
+    }
+
+    mvwprintw(input_win, 1, 1, "Enter %s:", label.c_str());
+    mvwprintw(input_win, 2, 1, "  [ %s ]",
+              value.empty() ? default_value.c_str() : shown.c_str());
+    mvwprintw(input_win, 4, 1,
+              "Type a value, or leave empty to use the default. Enter = done");
+    wrefresh(input_win);
+
+    int ch = wgetch(input_win);
+    if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+      return value.empty() ? default_value : value;
+    }
+    if (ch == KEY_BACKSPACE || ch == 127 || ch == 8 || ch == KEY_DC) {
+      if (!value.empty()) {
+        value.pop_back();
+      }
+    } else if (ch >= 32 && ch <= 126) {
+      if (value.size() < 64) {
+        value.push_back(static_cast<char>(ch));
+      }
+    }
+  }
+}
+
+void ChatClient::collectInputFields() {
+  nodelay(input_win, FALSE);
+
+  server_ip = readField("server IP address", "127.0.0.1", false);
+  server_password = readField("server password", "password", true);
+  client_username = readField("username", "user", false);
+
+  nodelay(input_win, TRUE);
+}
+
 void ChatClient::run() {
+  collectInputFields();
+
+  m_tcp_client = std::make_unique<nexilis::TCPClient>(
+      &m_protocol_manager, server_ip, server_password);
 
   std::vector<nexilis::RoomInfo> rooms;
   std::atomic<bool> ready = false;
   std::mutex mtx;
-  auto start_client = nexilis::startClient(m_tcp_client, rooms, ready, mtx);
-  start_client.detach();
+  auto start_thread = nexilis::startClient(*m_tcp_client, rooms, ready, mtx);
+  start_thread.detach();
 
-  // First display input fields
-  displayInputFields();
-  wrefresh(input_win);
-
-  // Get user input for connection
-  bool input_complete = false;
-  int current_field = 0; // 0 = server IP, 1 = password, 2 = username
-
-  while (!input_complete) {
-    handleInput();
-    updateUI();
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    // Simple input collection logic for demo purposes
-    if (current_field == 0) {
-      server_ip = "127.0.0.1";
-      current_field = 1;
-    } else if (current_field == 1) {
-      server_password = "password";
-      current_field = 2;
-    } else if (current_field == 2) {
-      client_username = "user";
-      current_field = 3;
-      input_complete = true;
-    }
+  // Wait for the server connection and room discovery (max ~10s).
+  for (int i = 0; i < 200 && !ready.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
 
-  // Connect to server
-  connectToServer();
+  std::vector<nexilis::RoomInfo> discovered_rooms;
+  {
+    std::lock_guard<std::mutex> lock(mtx);
+    discovered_rooms = rooms;
+  }
+
+  connectToServer(discovered_rooms);
+  connected = true;
 
   // Main chat loop
   while (true) {
     handleInput();
     updateUI();
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
 }
 
 void ChatClient::handleInput() {
   int ch = wgetch(input_win);
+  if (ch == ERR) {
+    return;
+  }
 
-  // Handle key presses
-  switch (ch) {
-  case KEY_UP:
-    // Handle up arrow
-    break;
-  case KEY_DOWN:
-    // Handle down arrow
-    break;
-  case '\n': // Enter key
-    // For now, just display a simple message
-    updateMessages("Message sent from " + client_username);
-    break;
-  case 'q':
-  case 'Q':
+  if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+    if (!current_message.empty()) {
+      sendMessage(current_message);
+      current_message.clear();
+    }
+    return;
+  }
+  if (ch == KEY_BACKSPACE || ch == 127 || ch == 8 || ch == KEY_DC) {
+    if (!current_message.empty()) {
+      current_message.pop_back();
+    }
+    return;
+  }
+  if (ch == 'q' || ch == 'Q') {
     endwin();
     exit(0);
-    break;
+  }
+  if (ch >= 32 && ch <= 126) {
+    if (current_message.size() < 256) {
+      current_message.push_back(static_cast<char>(ch));
+    }
   }
 }
 
 void ChatClient::updateUI() {
+  pollRoomMessages();
   displayMessages();
   displayInputFields();
   displayStatus();
@@ -165,24 +226,30 @@ void ChatClient::displayMessages() {
   werase(message_win);
   box(message_win, 0, 0);
 
-  // Display messages
-  for (size_t i = 0; i < messages.size() && i < LINES - 10; ++i) {
-    mvwprintw(message_win, i + 1, 1, "%s", messages[i].c_str());
-  }
+  int win_height, win_width;
+  getmaxyx(message_win, win_height, win_width);
 
-  wrefresh(message_win);
+  int max_rows = win_height - 2;
+  int start = messages.size() > static_cast<size_t>(max_rows)
+                  ? static_cast<int>(messages.size()) - max_rows
+                  : 0;
+
+  int row = 1;
+  for (size_t i = start; i < messages.size(); ++i) {
+    mvwprintw(message_win, row++, 1, "%s", messages[i].c_str());
+  }
 }
 
 void ChatClient::displayInputFields() {
   werase(input_win);
   box(input_win, 0, 0);
 
-  mvwprintw(input_win, 1, 1, "Server IP: %s", server_ip.c_str());
-  mvwprintw(input_win, 2, 1, "Password: %s", server_password.c_str());
-  mvwprintw(input_win, 3, 1, "Username: %s", client_username.c_str());
-  mvwprintw(input_win, 5, 1, "Press Enter to send message");
-  mvwprintw(input_win, 6, 1, "Press 'q' to quit");
+  mvwprintw(input_win, 1, 1, "Server: %s", server_ip.c_str());
+  mvwprintw(input_win, 2, 1, "User:   %s", client_username.c_str());
+  mvwprintw(input_win, 3, 1, "> %s", current_message.c_str());
+  mvwprintw(input_win, 5, 1, "Enter: send    q: quit");
 
+  wmove(input_win, 3, 3 + static_cast<int>(current_message.size()));
   wrefresh(input_win);
 }
 
@@ -190,23 +257,75 @@ void ChatClient::displayStatus() {
   werase(status_win);
   box(status_win, 0, 0);
 
-  wrefresh(status_win);
+  if (!connected) {
+    mvwprintw(status_win, 1, 1, "Status: Not connected");
+  } else if (!authenticated) {
+    mvwprintw(status_win, 1, 1, "Status: Connecting...");
+  } else {
+    mvwprintw(status_win, 1, 1, "Status: Connected");
+  }
 }
 
-void ChatClient::connectToServer() {
+void ChatClient::connectToServer(const std::vector<nexilis::RoomInfo> &rooms) {
+  if (rooms.empty()) {
+    updateMessages("No rooms found, cannot join.");
+    return;
+  }
 
-  auto &rooms = m_tcp_client.getClientAPI().getActiveRooms();
-
-  m_tcp_client.sendMessage(
-      nexilis::client::Packet::Room::Management::join(rooms[0].getId()));
+  m_room_id = rooms[0].getId();
+  m_tcp_client->sendMessage(
+      nexilis::client::Packet::Room::Management::join(m_tcp_client->getClientAPI(), m_room_id));
+  authenticated = true;
 }
 
 void ChatClient::sendMessage(const std::string &message) {
+  if (!m_tcp_client) {
+    return;
+  }
 
-  m_tcp_client.sendMessage(
-      nexilis::client::Packet::Room::Communicate::broadcast(message));
+  m_tcp_client->sendMessage(
+      nexilis::client::Packet::Room::Communicate::broadcast(m_tcp_client->getClientAPI(), message));
+}
 
-  updateMessages("[" + client_username + "]: " + message);
+void ChatClient::pollRoomMessages() {
+  if (!m_tcp_client || m_room_id == 0) {
+    return;
+  }
+
+  auto &api = m_tcp_client->getClientAPI();
+  if (!api.isInitialized()) {
+    return;
+  }
+
+  auto *room = api.getRoom(m_room_id);
+  if (!room) {
+    return;
+  }
+
+  const auto &room_messages = room->getMessages();
+  if (room_messages.size() <= m_last_message_count) {
+    return;
+  }
+
+  for (size_t i = m_last_message_count; i < room_messages.size(); ++i) {
+    const auto &communication = room_messages[i];
+
+    std::string name = "unknown";
+    const auto *sender = communication.getClient();
+    if (sender) {
+      if (sender->getId() == api.getClientId()) {
+        name = client_username;
+      } else if (!sender->getUsername().empty()) {
+        name = sender->getUsername();
+      } else {
+        name = "user" + std::to_string(sender->getId());
+      }
+    }
+
+    updateMessages("[" + name + "]: " + communication.getPayload());
+  }
+
+  m_last_message_count = room_messages.size();
 }
 
 void ChatClient::updateMessages(const std::string &message) {
