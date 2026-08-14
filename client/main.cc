@@ -275,6 +275,8 @@ void ChatClient::connectToServer(const std::vector<nexilis::RoomInfo> &rooms) {
   m_room_id = rooms[0].getId();
   m_tcp_client->sendMessage(
       nexilis::client::Packet::Room::Management::join(m_tcp_client->getClientAPI(), m_room_id));
+  m_tcp_client->sendMessage(
+      nexilis::client::Packet::Set::General::username(m_tcp_client->getClientAPI(), client_username));
   authenticated = true;
 }
 
