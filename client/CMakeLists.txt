@@ -12,6 +12,7 @@ find_package(Nexilis REQUIRED CONFIG)
 
 # Find other required packages
 find_package(PkgConfig REQUIRED)
+set(CURSES_NEED_WIDE TRUE)
 find_package(Curses REQUIRED)
 find_package(Threads REQUIRED)
 

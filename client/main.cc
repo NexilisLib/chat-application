@@ -1,5 +1,7 @@
 #include <atomic>
 #include <chrono>
+#include <clocale>
+#include <cwctype>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -12,6 +14,36 @@
 #include <nexilis/tcp_client.hh>
 
 #include <ncurses.h>
+
+void appendUtf8(std::string &out, wint_t wc) {
+  if (wc < 0x80) {
+    out.push_back(static_cast<char>(wc));
+  } else if (wc < 0x800) {
+    out.push_back(static_cast<char>(0xC0 | (wc >> 6)));
+    out.push_back(static_cast<char>(0x80 | (wc & 0x3F)));
+  } else if (wc < 0x10000) {
+    out.push_back(static_cast<char>(0xE0 | (wc >> 12)));
+    out.push_back(static_cast<char>(0x80 | ((wc >> 6) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | (wc & 0x3F)));
+  } else {
+    out.push_back(static_cast<char>(0xF0 | (wc >> 18)));
+    out.push_back(static_cast<char>(0x80 | ((wc >> 12) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | ((wc >> 6) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | (wc & 0x3F)));
+  }
+}
+
+void popBackUtf8(std::string &s) {
+  if (s.empty()) {
+    return;
+  }
+  size_t bytes = 1;
+  while (bytes <= s.size() && bytes < 4 &&
+         (static_cast<unsigned char>(s[s.size() - bytes]) & 0xC0) == 0x80) {
+    ++bytes;
+  }
+  s.erase(s.size() - bytes);
+}
 
 class ChatClient {
 public:
@@ -65,6 +97,7 @@ private:
 };
 
 ChatClient::ChatClient() : connected(false), authenticated(false) {
+  setlocale(LC_ALL, "");
   // Initialize ncurses
   initscr();
   cbreak();
@@ -121,17 +154,30 @@ std::string ChatClient::readField(const std::string &label,
               "Type a value, or leave empty to use the default. Enter = done");
     wrefresh(input_win);
 
-    int ch = wgetch(input_win);
-    if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+    int result;
+    wint_t wc;
+    result = wget_wch(input_win, &wc);
+    if (result == ERR) {
+      continue;
+    }
+
+    if (result == KEY_CODE_YES) {
+      if (wc == KEY_BACKSPACE || wc == KEY_DC) {
+        popBackUtf8(value);
+      }
+      continue;
+    }
+
+    if (wc == L'\n' || wc == L'\r') {
       return value.empty() ? default_value : value;
     }
-    if (ch == KEY_BACKSPACE || ch == 127 || ch == 8 || ch == KEY_DC) {
-      if (!value.empty()) {
-        value.pop_back();
-      }
-    } else if (ch >= 32 && ch <= 126) {
+    if (wc == 127 || wc == 8) {
+      popBackUtf8(value);
+      continue;
+    }
+    if (wc >= 32 && iswprint(wc)) {
       if (value.size() < 64) {
-        value.push_back(static_cast<char>(ch));
+        appendUtf8(value, wc);
       }
     }
   }
@@ -182,31 +228,37 @@ void ChatClient::run() {
 }
 
 void ChatClient::handleInput() {
-  int ch = wgetch(input_win);
-  if (ch == ERR) {
+  wint_t wc;
+  int result = wget_wch(input_win, &wc);
+  if (result == ERR) {
     return;
   }
 
-  if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+  if (result == KEY_CODE_YES) {
+    if (wc == KEY_BACKSPACE || wc == KEY_DC) {
+      popBackUtf8(current_message);
+    }
+    return;
+  }
+
+  if (wc == L'\n' || wc == L'\r') {
     if (!current_message.empty()) {
       sendMessage(current_message);
       current_message.clear();
     }
     return;
   }
-  if (ch == KEY_BACKSPACE || ch == 127 || ch == 8 || ch == KEY_DC) {
-    if (!current_message.empty()) {
-      current_message.pop_back();
-    }
+  if (wc == 127 || wc == 8) {
+    popBackUtf8(current_message);
     return;
   }
-  if (ch == 'q' || ch == 'Q') {
+  if (wc == 'q' || wc == 'Q') {
     endwin();
     exit(0);
   }
-  if (ch >= 32 && ch <= 126) {
+  if (wc >= 32 && iswprint(wc)) {
     if (current_message.size() < 256) {
-      current_message.push_back(static_cast<char>(ch));
+      appendUtf8(current_message, wc);
     }
   }
 }
@@ -249,7 +301,6 @@ void ChatClient::displayInputFields() {
   mvwprintw(input_win, 3, 1, "> %s", current_message.c_str());
   mvwprintw(input_win, 5, 1, "Enter: send    q: quit");
 
-  wmove(input_win, 3, 3 + static_cast<int>(current_message.size()));
   wrefresh(input_win);
 }
 
