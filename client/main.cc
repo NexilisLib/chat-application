@@ -61,7 +61,7 @@ private:
   void updateUI();
   void connectToServer(const std::vector<nexilis::RoomInfo> &rooms);
   void sendMessage(const std::string &message);
-  void pollRoomMessages();
+  bool pollRoomMessages();
   void displayMessages();
   void displayInputFields();
   void displayStatus();
@@ -94,6 +94,11 @@ private:
   // Joined room state
   uint64_t m_room_id = 0;
   size_t m_last_message_count = 0;
+
+  // Redraw flags
+  bool m_messages_dirty = true;
+  bool m_input_dirty = true;
+  bool m_status_dirty = true;
 };
 
 ChatClient::ChatClient() : connected(false), authenticated(false) {
@@ -218,6 +223,7 @@ void ChatClient::run() {
 
   connectToServer(discovered_rooms);
   connected = true;
+  m_status_dirty = true;
 
   // Main chat loop
   while (true) {
@@ -237,6 +243,7 @@ void ChatClient::handleInput() {
   if (result == KEY_CODE_YES) {
     if (wc == KEY_BACKSPACE || wc == KEY_DC) {
       popBackUtf8(current_message);
+      m_input_dirty = true;
     }
     return;
   }
@@ -245,11 +252,13 @@ void ChatClient::handleInput() {
     if (!current_message.empty()) {
       sendMessage(current_message);
       current_message.clear();
+      m_input_dirty = true;
     }
     return;
   }
   if (wc == 127 || wc == 8) {
     popBackUtf8(current_message);
+    m_input_dirty = true;
     return;
   }
   if (wc == 'q' || wc == 'Q') {
@@ -259,19 +268,33 @@ void ChatClient::handleInput() {
   if (wc >= 32 && iswprint(wc)) {
     if (current_message.size() < 256) {
       appendUtf8(current_message, wc);
+      m_input_dirty = true;
     }
   }
 }
 
 void ChatClient::updateUI() {
-  pollRoomMessages();
-  displayMessages();
-  displayInputFields();
-  displayStatus();
+  bool messages_changed = pollRoomMessages();
 
-  wrefresh(message_win);
-  wrefresh(input_win);
-  wrefresh(status_win);
+  if (messages_changed || m_messages_dirty) {
+    displayMessages();
+    m_messages_dirty = false;
+  }
+  if (m_input_dirty) {
+    displayInputFields();
+    m_input_dirty = false;
+  }
+  if (m_status_dirty) {
+    displayStatus();
+    m_status_dirty = false;
+  }
+
+  // Flush all windows in one pass. The input window is refreshed last so the
+  // hardware cursor stays in the message input field.
+  wnoutrefresh(message_win);
+  wnoutrefresh(status_win);
+  wnoutrefresh(input_win);
+  doupdate();
 }
 
 void ChatClient::displayMessages() {
@@ -300,8 +323,6 @@ void ChatClient::displayInputFields() {
   mvwprintw(input_win, 2, 1, "User:   %s", client_username.c_str());
   mvwprintw(input_win, 3, 1, "> %s", current_message.c_str());
   mvwprintw(input_win, 5, 1, "Enter: send    q: quit");
-
-  wrefresh(input_win);
 }
 
 void ChatClient::displayStatus() {
@@ -329,6 +350,7 @@ void ChatClient::connectToServer(const std::vector<nexilis::RoomInfo> &rooms) {
   m_tcp_client->sendMessage(
       nexilis::client::Packet::Set::General::username(m_tcp_client->getClientAPI(), client_username));
   authenticated = true;
+  m_status_dirty = true;
 }
 
 void ChatClient::sendMessage(const std::string &message) {
@@ -340,24 +362,24 @@ void ChatClient::sendMessage(const std::string &message) {
       nexilis::client::Packet::Room::Communicate::broadcast(m_tcp_client->getClientAPI(), message));
 }
 
-void ChatClient::pollRoomMessages() {
+bool ChatClient::pollRoomMessages() {
   if (!m_tcp_client || m_room_id == 0) {
-    return;
+    return false;
   }
 
   auto &api = m_tcp_client->getClientAPI();
   if (!api.isInitialized()) {
-    return;
+    return false;
   }
 
   auto *room = api.getRoom(m_room_id);
   if (!room) {
-    return;
+    return false;
   }
 
   const auto &room_messages = room->getMessages();
   if (room_messages.size() <= m_last_message_count) {
-    return;
+    return false;
   }
 
   for (size_t i = m_last_message_count; i < room_messages.size(); ++i) {
@@ -379,6 +401,7 @@ void ChatClient::pollRoomMessages() {
   }
 
   m_last_message_count = room_messages.size();
+  return true;
 }
 
 void ChatClient::updateMessages(const std::string &message) {
@@ -388,6 +411,7 @@ void ChatClient::updateMessages(const std::string &message) {
   if (messages.size() > 50) {
     messages.erase(messages.begin());
   }
+  m_messages_dirty = true;
 }
 
 int main() {
