@@ -8,8 +8,8 @@
 #include <thread>
 #include <vector>
 
+#include <nexilis/client/client_api.hh>
 #include <nexilis/client/packet.hh>
-#include <nexilis/protocol_manager.hh>
 #include <nexilis/start_client.hh>
 #include <nexilis/tcp_client.hh>
 
@@ -68,7 +68,7 @@ private:
 
   void updateMessages(const std::string &message);
 
-  nexilis::ProtocolManager m_protocol_manager;
+  std::unique_ptr<nexilis::client::ClientAPI> m_client_api;
   std::unique_ptr<nexilis::TCPClient> m_tcp_client;
 
   // UI elements
@@ -201,13 +201,20 @@ void ChatClient::collectInputFields() {
 void ChatClient::run() {
   collectInputFields();
 
-  m_tcp_client = std::make_unique<nexilis::TCPClient>(
-      &m_protocol_manager, server_ip, server_password);
+  nexilis::client::ClientConfig config;
+  config.setMode(nexilis::AuthenticationMode::password_protected);
+  config.setPassword(server_password);
+  config.setBoostTCPAddress(server_ip);
+
+  m_client_api =
+      std::make_unique<nexilis::client::ClientAPI>(std::move(config));
+  m_tcp_client = std::make_unique<nexilis::TCPClient>(*m_client_api);
 
   std::vector<nexilis::RoomInfo> rooms;
   std::atomic<bool> ready = false;
   std::mutex mtx;
-  auto start_thread = nexilis::startClient(*m_tcp_client, rooms, ready, mtx);
+  auto start_thread =
+      nexilis::startClient(*m_client_api, *m_tcp_client, rooms, ready, mtx);
   start_thread.detach();
 
   // Wait for the server connection and room discovery (max ~10s).
@@ -346,28 +353,31 @@ void ChatClient::connectToServer(const std::vector<nexilis::RoomInfo> &rooms) {
 
   m_room_id = rooms[0].getId();
   m_tcp_client->sendMessage(
-      nexilis::client::Packet::Room::Management::join(m_tcp_client->getClientAPI(), m_room_id));
+      nexilis::client::Packet::Room::Management::join(*m_client_api,
+                                                      m_room_id));
   m_tcp_client->sendMessage(
-      nexilis::client::Packet::Set::General::username(m_tcp_client->getClientAPI(), client_username));
+      nexilis::client::Packet::Set::General::username(*m_client_api,
+                                                      client_username));
   authenticated = true;
   m_status_dirty = true;
 }
 
 void ChatClient::sendMessage(const std::string &message) {
-  if (!m_tcp_client) {
+  if (!m_tcp_client || !m_client_api) {
     return;
   }
 
   m_tcp_client->sendMessage(
-      nexilis::client::Packet::Room::Communicate::broadcast(m_tcp_client->getClientAPI(), message));
+      nexilis::client::Packet::Room::Communicate::broadcast(*m_client_api,
+                                                            message));
 }
 
 bool ChatClient::pollRoomMessages() {
-  if (!m_tcp_client || m_room_id == 0) {
+  if (!m_tcp_client || !m_client_api || m_room_id == 0) {
     return false;
   }
 
-  auto &api = m_tcp_client->getClientAPI();
+  auto &api = *m_client_api;
   if (!api.isInitialized()) {
     return false;
   }
